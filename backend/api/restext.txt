@@ -1,0 +1,229 @@
+Entity Sketch: ------->>>
+
+// tenancy module
+class Organization {
+    UUID id;
+    String name;                 // "Zomato"
+    String slug;                 // "zomato" — URL-safe, unique globally
+    OrgStatus status;            // ACTIVE, SUSPENDED
+    Instant createdAt;
+}
+
+class Project {
+    UUID id;
+    UUID organizationId;         // ◄── tenant discriminator, on EVERY tenant table
+    String name;                 // "Consumer App"
+    String key;                  // "consumer-app" — unique within org
+    Instant createdAt;
+}
+
+class Environment {
+    UUID id;
+    UUID organizationId;         // denormalised on purpose — see §4.3
+    UUID projectId;
+    String key;                  // "dev" | "staging" | "prod" — unique within project
+    String name;
+    boolean production;          // drives UI warnings on dangerous edits
+}
+
+// flags module
+class Flag {
+    UUID id;
+    UUID organizationId;
+    UUID projectId;
+    String key;                  // "holiday-banner" — unique within project; what the SDK sends
+    String name;
+    String description;
+    FlagType type;               // BOOLEAN | CONFIG
+    boolean archived;
+    Instant createdAt;
+}
+
+class FlagEnvironmentState {
+    UUID id;
+    UUID organizationId;
+    UUID flagId;
+    UUID environmentId;
+    boolean enabled;             // the master switch for this env
+    JsonNode value;              // CONFIG flags only; null for BOOLEAN
+    Integer rolloutPercentage;   // null = 100%; 0-99 = partial rollout
+    List<TargetingRule> rules;   // ordered, first match wins
+    Instant updatedAt;
+}
+
+// targeting module
+class TargetingRule {
+    UUID id;
+    UUID flagEnvironmentStateId;
+    int priority;                // 0 = evaluated first
+    String attribute;            // "country", "plan", "email"
+    Operator operator;           // EQUALS, NOT_EQUALS, IN, CONTAINS, ENDS_WITH
+    List<String> values;         // ["IN", "LK"]
+    boolean resultEnabled;       // what to return when this rule matches
+    JsonNode resultValue;        // for CONFIG flags
+}
+
+// identity module
+class User {
+    UUID id;
+    String email;                // unique, lowercased
+    String passwordHash;         // bcrypt
+    String name;
+    boolean platformOwner;       // true only for us — grants cross-tenant access
+}
+
+class Membership {
+    UUID id;
+    UUID userId;
+    UUID organizationId;
+    Role role;                   // TENANT_ADMIN | TENANT_DEVELOPER
+}
+
+// apikeys module
+class ApiKey {
+    UUID id;
+    UUID organizationId;
+    UUID environmentId;          // a key unlocks exactly ONE environment
+    String name;                 // "prod backend"
+    String prefix;               // "sk_prod_a8f3" — safe to display
+    String keyHash;              // SHA-256 of the full key. Plaintext is never stored.
+    Instant lastUsedAt;
+    Instant revokedAt;           // non-null = dead
+}
+
+// audit module
+class AuditLog {
+    UUID id;
+    UUID organizationId;
+    UUID actorUserId;            // null when the actor was a machine
+    String actorType;            // USER | API_KEY | SYSTEM | AI
+    String action;               // "flag.enabled", "apikey.revoked"
+    String targetType;           // "Flag"
+    UUID targetId;
+    JsonNode metadata;           // { "before": false, "after": true }
+    Instant createdAt;           // append-only. No update, no delete, ever.
+}
+
+
+=============================================================================================
+
+Database Schema:
+
+CREATE TABLE organization (
+    id          UUID PRIMARY KEY,
+    name        TEXT        NOT NULL,
+    slug        TEXT        NOT NULL,
+    status      TEXT        NOT NULL DEFAULT 'ACTIVE',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_org_slug UNIQUE (slug)
+);
+
+CREATE TABLE project (
+    id               UUID PRIMARY KEY,
+    organization_id  UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    name             TEXT NOT NULL,
+    key              TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_project_key_per_org UNIQUE (organization_id, key)
+);
+CREATE INDEX idx_project_org ON project(organization_id);
+
+CREATE TABLE environment (
+    id               UUID PRIMARY KEY,
+    organization_id  UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    project_id       UUID NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    key              TEXT NOT NULL,           -- dev | staging | prod
+    name             TEXT NOT NULL,
+    production       BOOLEAN NOT NULL DEFAULT false,
+    CONSTRAINT uq_env_key_per_project UNIQUE (project_id, key)
+);
+
+CREATE TABLE flag (
+    id               UUID PRIMARY KEY,
+    organization_id  UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    project_id       UUID NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+    key              TEXT NOT NULL,           -- what the SDK sends
+    name             TEXT NOT NULL,
+    description      TEXT,
+    type             TEXT NOT NULL,           -- BOOLEAN | CONFIG
+    archived_at      TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_flag_key_per_project UNIQUE (project_id, key),
+    CONSTRAINT ck_flag_type CHECK (type IN ('BOOLEAN','CONFIG'))
+);
+CREATE INDEX idx_flag_project ON flag(project_id) WHERE archived_at IS NULL;
+
+CREATE TABLE flag_environment_state (
+    id                  UUID PRIMARY KEY,
+    organization_id     UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    flag_id             UUID NOT NULL REFERENCES flag(id) ON DELETE CASCADE,
+    environment_id      UUID NOT NULL REFERENCES environment(id) ON DELETE CASCADE,
+    enabled             BOOLEAN NOT NULL DEFAULT false,
+    value               JSONB,                -- CONFIG flags only
+    rollout_percentage  INT,                  -- NULL = 100%
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_state_per_flag_env UNIQUE (flag_id, environment_id),
+    CONSTRAINT ck_rollout CHECK (rollout_percentage IS NULL
+                                 OR rollout_percentage BETWEEN 0 AND 100)
+);
+-- THE index that matters: the evaluation hot path reads by environment
+CREATE INDEX idx_state_env ON flag_environment_state(environment_id);
+
+CREATE TABLE targeting_rule (
+    id                        UUID PRIMARY KEY,
+    organization_id           UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    flag_environment_state_id UUID NOT NULL
+                              REFERENCES flag_environment_state(id) ON DELETE CASCADE,
+    priority                  INT  NOT NULL,
+    attribute                 TEXT NOT NULL,
+    operator                  TEXT NOT NULL,
+    values                    JSONB NOT NULL,   -- ["IN","LK"]
+    result_enabled            BOOLEAN NOT NULL,
+    result_value              JSONB,
+    CONSTRAINT uq_rule_priority UNIQUE (flag_environment_state_id, priority)
+);
+
+CREATE TABLE app_user (                        -- "user" is reserved in Postgres
+    id             UUID PRIMARY KEY,
+    email          TEXT NOT NULL,
+    password_hash  TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    platform_owner BOOLEAN NOT NULL DEFAULT false,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_user_email UNIQUE (email)
+);
+
+CREATE TABLE membership (
+    id               UUID PRIMARY KEY,
+    user_id          UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+    organization_id  UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    role             TEXT NOT NULL,            -- TENANT_ADMIN | TENANT_DEVELOPER
+    CONSTRAINT uq_membership UNIQUE (user_id, organization_id)
+);
+
+CREATE TABLE api_key (
+    id               UUID PRIMARY KEY,
+    organization_id  UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
+    environment_id   UUID NOT NULL REFERENCES environment(id) ON DELETE CASCADE,
+    name             TEXT NOT NULL,
+    prefix           TEXT NOT NULL,            -- displayable
+    key_hash         TEXT NOT NULL,            -- SHA-256
+    last_used_at     TIMESTAMPTZ,
+    revoked_at       TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_api_key_hash UNIQUE (key_hash)
+);
+CREATE INDEX idx_apikey_hash ON api_key(key_hash) WHERE revoked_at IS NULL;
+
+CREATE TABLE audit_log (
+    id               UUID PRIMARY KEY,
+    organization_id  UUID NOT NULL,
+    actor_user_id    UUID,
+    actor_type       TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    target_type      TEXT NOT NULL,
+    target_id        UUID,
+    metadata         JSONB,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_audit_org_time ON audit_log(organization_id, created_at DESC);
